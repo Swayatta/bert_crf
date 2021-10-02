@@ -4,7 +4,11 @@ __author__ = 'Dhanachandra N.'
 
 #from __future__ import unicode_literals, print_function, division
 from io import open
+import nltk
+nltk.download('stopwords')
+from nltk.corpus import stopwords
 import unicodedata
+import pke
 import string
 import re
 import random
@@ -34,6 +38,40 @@ import sys
 from optparse import OptionParser
 
 #to initialize the network weight with fix seed. 
+def get_keyphrases(text = "abcd efg hijk I am this"):
+  extractor = pke.unsupervised.MultipartiteRank()
+
+  # 2. load the content of the document.
+  # text = "शाहरुख खान एक बॉलीवुड अभिनेता हैं जो मुंबई में रहते हैं"
+  extractor.load_document(input=text)
+
+  # 3. select the longest sequences of nouns and adjectives, that do
+  #    not contain punctuation marks or stopwords as candidates.
+  pos = {'NOUN', 'PROPN', 'ADJ'}
+  stoplist = list(string.punctuation)
+  stoplist += ['-lrb-', '-rrb-', '-lcb-', '-rcb-', '-lsb-', '-rsb-']
+  stoplist += stopwords.words('english')
+  extractor.candidate_selection(pos=pos, stoplist=stoplist)
+
+  # 4. build the Multipartite graph and rank candidates using random walk,
+  #    alpha controls the weight adjustment mechanism, see TopicRank for
+  #    threshold/method parameters.
+  extractor.candidate_weighting(alpha=1.1,
+                                threshold=0.74,
+                                method='average')
+
+  # 5. get the 10-highest scored candidates as keyphrases
+  keyphrases = extractor.get_n_best(n=1000)
+  return keyphrases
+
+def create_doc(doc):
+  '''Function to create the document by combining all the words in a sentence and 
+  all the sentences in one document list.
+  Input : list of sentences present in a document. Each sentence in this list is
+  a list of words.
+  Output: document (text)'''
+  return " ".join([ token for sentence in doc for token in sentence])
+
 def seed_torch(seed=12345):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -49,6 +87,8 @@ from collections import OrderedDict
 # read the corpus and return them into list of sentences of list of tokens
 def corpus_reader(path, delim='\t', word_idx=0, label_idx=-1):
     print(path)
+    delim='\t'
+    docs,tmp_sents = [],[]
     tokens, labels = [], []
     tmp_tok, tmp_lab = [], []
     label_set = []
@@ -56,9 +96,16 @@ def corpus_reader(path, delim='\t', word_idx=0, label_idx=-1):
         for line in reader:
             line = line.strip()
             cols = line.split(delim)
+             #document
+            if cols[0][1:9] == 'DOCSTART':
+              docs.append(tmp_sents)
+              tmp_sents = []
+
             if len(cols)<2 and cols[0] == '' :
               if len(tmp_tok) > 0 and len(tmp_tok)<110:
                   tokens.append(tmp_tok); labels.append(tmp_lab)
+                  # for document
+                  tmp_sents.append(tmp_tok)
               tmp_tok = []
               tmp_lab = []
             elif len(cols)<2:
@@ -68,7 +115,7 @@ def corpus_reader(path, delim='\t', word_idx=0, label_idx=-1):
                 tmp_tok.append(cols[word_idx])
                 tmp_lab.append(cols[label_idx])
                 label_set.append(cols[label_idx])
-    return tokens, labels, list(OrderedDict.fromkeys(label_set))
+    return docs,tokens, labels, list(OrderedDict.fromkeys(label_set))
 
 class NER_Dataset(data.Dataset):
     def __init__(self, tag2idx, sentences, labels, tokenizer_path = '', do_lower_case=True):
@@ -158,7 +205,7 @@ class Bert_CRF(BertPreTrainedModel):
 
 def generate_training_data(config, bert_tokenizer="bert-base", do_lower_case=True):
     training_data, validation_data = config.data_dir+config.training_data, config.data_dir+config.val_data 
-    train_sentences, train_labels, label_set = corpus_reader(training_data, delim=' ')
+    train_docs, train_sentences, train_labels, label_set = corpus_reader(training_data, delim=' ')
     label_set.append('X')
     tag2idx = {t:i for i, t in enumerate(label_set)}
     print('Training datas: ', len(train_sentences))
@@ -166,7 +213,7 @@ def generate_training_data(config, bert_tokenizer="bert-base", do_lower_case=Tru
     # save the tag2indx dictionary. Will be used while prediction
     with open(config.apr_dir + 'tag2idx.pkl', 'wb') as f:
         pickle.dump(tag2idx, f, pickle.HIGHEST_PROTOCOL)
-    dev_sentences, dev_labels, _ = corpus_reader(validation_data, delim=' ')
+    dev_docs,dev_sentences, dev_labels, _ = corpus_reader(validation_data, delim=' ')
     dev_dataset = NER_Dataset(tag2idx, dev_sentences, dev_labels, tokenizer_path = bert_tokenizer, do_lower_case=do_lower_case)
 
     train_iter = data.DataLoader(dataset=train_dataset,
@@ -183,14 +230,15 @@ def generate_training_data(config, bert_tokenizer="bert-base", do_lower_case=Tru
 
 def generate_test_data(config, tag2idx, bert_tokenizer="bert-base", do_lower_case=True):
     test_data = config.data_dir+config.test_data
-    test_sentences, test_labels, _ = corpus_reader(test_data, delim=' ')
+    test_docs,test_sentences, test_labels, _ = corpus_reader(test_data, delim=' ')
+    keyphrases_perdoc = [get_keyphrases(create_doc(doc)) for doc in test_docs]
     test_dataset = NER_Dataset(tag2idx, test_sentences, test_labels, tokenizer_path = bert_tokenizer, do_lower_case=do_lower_case)
     test_iter = data.DataLoader(dataset=test_dataset,
                                 batch_size=config.batch_size,
                                 shuffle=False,
                                 num_workers=1,
                                 collate_fn=pad)
-    return test_iter
+    return keyphrases_perdoc,test_iter
 
 def train(train_iter, eval_iter, tag2idx, config, bert_model="bert-base-uncased"):
     # print('#Tags: ', len(tag2idx))
@@ -306,11 +354,14 @@ def train(train_iter, eval_iter, tag2idx, config, bert_model="bert-base-uncased"
 '''
     raw_text should pad data in raw data prediction
 '''
-def test(config, test_iter, model, unique_labels, test_output):
+def test(config, keyphrases_perdoc,test_iter, model, unique_labels, test_output):
     model.eval()
     writer = open(config.apr_dir + test_output, 'w')
+    count = 0
     for i, batch in enumerate(test_iter):
+        count +=1
         token_ids, attn_mask, org_tok_map, labels, original_token, sorted_idx = batch
+        print("sorted_idx length :",len(sorted_idx))
         #attn_mask.dt
         inputs = {'input_ids': token_ids.to(device),
                   'attn_masks' : attn_mask.to(device)
@@ -330,6 +381,7 @@ def test(config, test_iter, model, unique_labels, test_output):
                 writer.write(pred_tag + '\n')
             writer.write('\n')
     writer.flush()
+    print("Count = ",count)
     command = "python conlleval.py < " + config.apr_dir + test_output
     process = subprocess.Popen(command,stdout=subprocess.PIPE, shell=True)
     result = process.communicate()[0].decode("utf-8")
@@ -436,9 +488,9 @@ if __name__ == "__main__":
         show_graph(t_loss, v_loss, config.apr_dir)
     elif options.model_mode == "test":
         model, bert_tokenizer, unique_labels, tag2idx = load_model(config=config, do_lower_case=True)
-        test_iter = generate_test_data(config, tag2idx, bert_tokenizer=config.bert_model, do_lower_case=True)
+        keyphrases_perdoc,test_iter = generate_test_data(config, tag2idx, bert_tokenizer=config.bert_model, do_lower_case=True)
         print('test len: ', len(test_iter))
-        test(config, test_iter, model, unique_labels, config.test_out)
+        test(config, keyphrases_perdoc,test_iter, model, unique_labels, config.test_out)
     elif options.model_mode == "raw_text":
         if config.raw_text == None:
             print('Please provide the raw text path on config.raw_text')
