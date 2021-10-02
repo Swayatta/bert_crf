@@ -238,7 +238,7 @@ def generate_test_data(config, tag2idx, bert_tokenizer="bert-base", do_lower_cas
                                 shuffle=False,
                                 num_workers=1,
                                 collate_fn=pad)
-    return keyphrases_perdoc,test_iter
+    return keyphrases_perdoc,test_docs,test_iter
 
 def train(train_iter, eval_iter, tag2idx, config, bert_model="bert-base-uncased"):
     # print('#Tags: ', len(tag2idx))
@@ -354,14 +354,19 @@ def train(train_iter, eval_iter, tag2idx, config, bert_model="bert-base-uncased"
 '''
     raw_text should pad data in raw data prediction
 '''
-def test(config, keyphrases_perdoc,test_iter, model, unique_labels, test_output):
+def test(config, keyphrases_perdoc,test_docs,test_iter, model, unique_labels, test_output):
     model.eval()
+    stop = set(stopwords.words('english'))
     writer = open(config.apr_dir + test_output, 'w')
+    total = 0
+    doctrack = []
+    for doc in test_docs:
+      total += len(doc)
+      doctrack.append(total)
+
     count = 0
     for i, batch in enumerate(test_iter):
-        count +=1
         token_ids, attn_mask, org_tok_map, labels, original_token, sorted_idx = batch
-        print("sorted_idx length :",len(sorted_idx))
         #attn_mask.dt
         inputs = {'input_ids': token_ids.to(device),
                   'attn_masks' : attn_mask.to(device)
@@ -370,14 +375,35 @@ def test(config, keyphrases_perdoc,test_iter, model, unique_labels, test_output)
             tag_seqs = model(**inputs)
         y_true = list(labels.cpu().numpy())
         for i in range(len(sorted_idx)):
+            # count +=1
+            # for j,length in enumerate(doctrack[1:]):
+            #   if count<length:
+            #     docidx = j+1
+            #     break
+            
+            # kp = keyphrases_perdoc[docidx]
+            # kp = [k for k,_ in kp]
+            # words = set([w for k in kp for w in k.split(' ')])
+            # doc = test_docs[docidx] #Corresponding document where the sentence occurs
+            # toklist = [tok for sent in doc for tok in sent] #All tokens present in that doc
+            
             o2m = org_tok_map[i]
             pos = sorted_idx.index(i)
             for j, orig_tok_idx in enumerate(o2m):
+                # if original_token[i][j] not in toklist:
+                #    print("Token not found")
+                #    print("Token : ",original_token[i][j]) 
                 writer.write(original_token[i][j] + '\t')
                 writer.write(unique_labels[y_true[pos][orig_tok_idx]] + '\t')
                 pred_tag = unique_labels[tag_seqs[pos][orig_tok_idx]]
                 if pred_tag == 'X':
                     pred_tag = 'O'
+                # if original_token[i][j] not in stop and len(original_token[i][j])>2:
+                #   if pred_tag!='O':
+                #     if original_token[i][j].lower() not in words:
+                #       print(original_token[i][j])
+                #       print("words :",words)
+                #       pred_tag='O'
                 writer.write(pred_tag + '\n')
             writer.write('\n')
     writer.flush()
@@ -488,9 +514,9 @@ if __name__ == "__main__":
         show_graph(t_loss, v_loss, config.apr_dir)
     elif options.model_mode == "test":
         model, bert_tokenizer, unique_labels, tag2idx = load_model(config=config, do_lower_case=True)
-        keyphrases_perdoc,test_iter = generate_test_data(config, tag2idx, bert_tokenizer=config.bert_model, do_lower_case=True)
+        keyphrases_perdoc,test_docs,test_iter = generate_test_data(config, tag2idx, bert_tokenizer=config.bert_model, do_lower_case=True)
         print('test len: ', len(test_iter))
-        test(config, keyphrases_perdoc,test_iter, model, unique_labels, config.test_out)
+        test(config, keyphrases_perdoc,test_docs,test_iter, model, unique_labels, config.test_out)
     elif options.model_mode == "raw_text":
         if config.raw_text == None:
             print('Please provide the raw text path on config.raw_text')
